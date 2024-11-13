@@ -1,8 +1,10 @@
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
 const User = require('../models/User');
 const UserDetails = require('../models/userDetails'); // Ensure correct import
 
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const tempOTPs = {}; // Temporarily store OTPs, passwords, and expiry times
 
 // Helper function to generate a 6-digit OTP
@@ -73,7 +75,7 @@ exports.resendOtp = async (req, res) => {
     }
 };
 
-// Signin function: returns accessToken and refreshToken
+// Signin function: returns accessToken and refreshToken for email login
 exports.signin = async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -96,60 +98,105 @@ exports.signin = async (req, res) => {
 
         // Set the accessToken as a secure, HttpOnly cookie
         res.cookie('accessToken', accessToken, {
-            httpOnly: true,    // Can't be accessed via JavaScript
-            secure: process.env.NODE_ENV === 'production',  // Set to true in production
-            maxAge: 15 * 60 * 1000,  // Token expires in 15 minutes
-            sameSite: 'Strict'   // Prevents CSRF attacks
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: 15 * 60 * 1000,
+            sameSite: 'Strict'
         });
 
         // Set the refreshToken as a secure cookie (optional)
         res.cookie('refreshToken', refreshToken, {
-            httpOnly: true,    // Can't be accessed via JavaScript
-            secure: process.env.NODE_ENV === 'production',  // Set to true in production
-            maxAge: 7 * 24 * 60 * 60 * 1000,  // Refresh token expires in 7 days
-            sameSite: 'Strict'   // Prevents CSRF attacks
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: 7 * 24 * 60 * 60 * 1000,
+            sameSite: 'Strict'
         });
 
-        res.status(200).json({
-            message: 'Signin successful. Tokens are stored as cookies.'
-        });
+        res.status(200).json({ message: 'Signin successful. Tokens are stored as cookies.' });
     } catch (err) {
         console.error("Error during signin:", err);
         res.status(500).json({ error: 'Server error' });
     }
 };
 
+exports.googleLogin = async (req, res) => {
+    try {
+        // Retrieve the id_token from the request body
+        const { token } = req.body;
+
+        if (!token) {
+            return res.status(400).json({ message: 'ID Token is required' });
+        }
+
+        // Verify the ID token with Google
+        const ticket = await client.verifyIdToken({
+            idToken: token,
+            audience: process.env.GOOGLE_CLIENT_ID,
+        });
+        
+        // Extract payload containing user info
+        const payload = ticket.getPayload();
+        const { email, name, picture } = payload;
+
+        // Check if user exists in our database
+        let user = await User.findOne({ email });
+        if (!user) {
+            // Create a new user if none exists
+            user = new User({ email, name, picture });
+            await user.save();
+        }
+
+        // Generate access and refresh tokens for the user
+        const accessToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '15m' });
+        const refreshToken = jwt.sign({ userId: user._id }, process.env.REFRESH_TOKEN_SECRET, { expiresIn: '7d' });
+
+        // Set tokens as cookies or send in response
+        res.cookie('accessToken', accessToken, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: 15 * 60 * 1000,
+            sameSite: 'Strict',
+        });
+
+        res.cookie('refreshToken', refreshToken, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: 7 * 24 * 60 * 60 * 1000,
+            sameSite: 'Strict',
+        });
+
+        res.status(200).json({ message: 'Google login successful', user });
+    } catch (error) {
+        console.error('Error in Google login:', error);
+        res.status(500).json({ message: 'Google login failed' });
+    }
+};
+
 // Refresh access token using refresh token
-// Refresh access token using refresh token from cookies
 exports.refreshAccessToken = async (req, res) => {
     try {
-        const refreshToken = req.cookies.refreshToken; // Get the refresh token from cookies
+        const refreshToken = req.cookies.refreshToken;
 
         if (!refreshToken) {
             return res.status(400).json({ message: 'Refresh token is required' });
         }
 
-        // Verify the refresh token
         jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET, async (err, decoded) => {
             if (err) {
                 return res.status(403).json({ message: 'Invalid or expired refresh token' });
             }
 
-            // Find the user associated with the refresh token
             const user = await User.findById(decoded.userId);
             if (!user) {
                 return res.status(404).json({ message: 'User not found' });
             }
 
-            // Create a new access token
             const accessToken = jwt.sign({ userId: user._id }, process.env.JWT_SECRET, { expiresIn: '15m' });
-
-            // Set the new access token as a secure HttpOnly cookie
             res.cookie('accessToken', accessToken, {
-                httpOnly: true, // Can't be accessed via JavaScript
-                secure: process.env.NODE_ENV === 'production', // Set to true in production
-                maxAge: 15 * 60 * 1000, // Token expires in 15 minutes
-                sameSite: 'Strict' // Prevents CSRF attacks
+                httpOnly: true,
+                secure: process.env.NODE_ENV === 'production',
+                maxAge: 15 * 60 * 1000,
+                sameSite: 'Strict'
             });
 
             return res.status(200).json({ message: 'New access token has been set in cookies' });
@@ -160,75 +207,17 @@ exports.refreshAccessToken = async (req, res) => {
     }
 };
 
-
 // Handle profile filling
 exports.fillYourProfile = async (req, res) => {
     try {
-        const { fullname, address, dateofbirth, email, mobile, gender, housename, landmark, pincode, district, state, profileImage } = req.body;
+        const { fullname, address, dateofbirth, gender, userId } = req.body;
 
-        // Get the access token from cookies
-        const token = req.cookies.accessToken;
+        const userDetails = new UserDetails({ fullname, address, dateofbirth, gender, user: userId });
+        await userDetails.save();
 
-        if (!token) {
-            return res.status(401).json({ message: 'Access token is required' });
-        }
-
-        // Verify the access token
-        jwt.verify(token, process.env.JWT_SECRET, async (err, decoded) => {
-            if (err) {
-                return res.status(403).json({ message: 'Invalid or expired token' });
-            }
-
-            const userId = decoded.userId;
-            const user = await User.findById(userId);
-
-            if (!user) {
-                return res.status(404).json({ message: 'User not found' });
-            }
-
-            // Check if user details already exist in the userdetails collection
-            let userDetails = await UserDetails.findOne({ userId });
-
-            if (!userDetails) {
-                // If no user details found, create a new entry
-                userDetails = new UserDetails({
-                    userId,
-                    fullname,
-                    address,
-                    dateofbirth,
-                    email,
-                    mobile,
-                    gender,
-                    housename,
-                    landmark,
-                    pincode,
-                    district,
-                    state,
-                    profileImage,
-                });
-            } else {
-                // If user details already exist, update them
-                userDetails.fullname = fullname || userDetails.fullname;
-                userDetails.address = address || userDetails.address;
-                userDetails.dateofbirth = dateofbirth || userDetails.dateofbirth;
-                userDetails.email = email || userDetails.email;
-                userDetails.mobile = mobile || userDetails.mobile;
-                userDetails.gender = gender || userDetails.gender;
-                userDetails.housename = housename || userDetails.housename;
-                userDetails.landmark = landmark || userDetails.landmark;
-                userDetails.pincode = pincode || userDetails.pincode;
-                userDetails.district = district || userDetails.district;
-                userDetails.state = state || userDetails.state;
-                userDetails.profileImage = profileImage || userDetails.profileImage;
-            }
-
-            // Save the user details to the database
-            await userDetails.save();
-
-            return res.status(200).json({ message: 'Profile updated successfully' });
-        });
+        res.status(200).json({ message: 'Profile filled successfully' });
     } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: 'Internal server error' });
+        console.error("Error during profile update:", err);
+        res.status(500).json({ error: 'Profile filling failed' });
     }
 };
